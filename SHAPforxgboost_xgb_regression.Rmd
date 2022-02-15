@@ -1,0 +1,292 @@
+---
+title: "popularity regression"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+	echo = TRUE,
+	fig.height = 5,
+	fig.width = 8,
+	message = FALSE,
+	warning = FALSE,
+	cache = TRUE,
+	cache.lazy = FALSE,
+	dpi = 180
+)
+library(tidyverse)
+library(silgelib)
+library(tvthemes)
+
+theme_set(theme_plex())
+update_geom_defaults("rect", list(fill = "midnightblue", alpha = 0.8))
+Sys.setlocale("LC_ALL","English")
+```
+
+#Explore data 
+Our modeling goal is to predict track popularity.
+
+```{r}
+setwd("C:/Data Science/2022/2022_02/popularity_xgb_regression")
+
+library(tidyverse)
+
+track <- read_csv("C:/Data Science/2022/2022_02/popularity_xgb_regression/track.csv")
+```
+
+How is popularity distributed?
+```{r}
+track %>%
+  #mutate(explicit = if_else(as.logical(explicit), "yes", "no")) %>%
+  ggplot(aes(popularity)) +
+  geom_histogram(alpha = 0.6) +
+  scale_x_log10()
+```
+
+```{r}
+track %>%
+  mutate(explicit = if_else(as.logical(explicit), "yes", "no")) %>%
+  select(explicit, danceability:time_signature) %>%
+  pivot_longer(danceability:time_signature) %>%
+  mutate(name = fct_inorder(name)) %>%
+  ggplot(aes(value, after_stat(density), fill = explicit)) +
+  geom_histogram(alpha = 0.5, binwidth = 1, position = "identity") +
+  facet_wrap(~name, scales = "free") +
+  labs(fill = "Explicit?")
+
+```
+
+```{r}
+library(corrr)
+
+track %>%
+  select(danceability:time_signature) %>%
+  na.omit() %>%
+  correlate() %>%
+  rearrange() %>%
+  network_plot(colours = c("orange",
+                           "white",
+                           "midnightblue"))
+```
+
+#Build a model 
+Let’s start our modeling by setting up our “data budget.”
+```{r}
+library(tidymodels)
+
+set.seed(123)
+pop_split <- initial_split(
+  track %>%
+    mutate(explicit = as.numeric(explicit)),
+  strata = popularity)
+pop_train <- training(pop_split)
+pop_test <- testing(pop_split)
+
+set.seed(234)
+pop_folds <- bootstraps(pop_train, strata = popularity)
+pop_folds
+```
+
+
+```{r}
+library(tidytext)
+library(stringi)
+
+split_category <- function(x) {
+  x %>%
+    str_split(" ") %>%
+    map(str_remove_all, "[:punct:]") %>%
+    map(str_remove_all, "[:digit:]") %>%
+    map(str_to_lower) %>%
+    map(stri_omit_empty)
+}
+
+pop_rec <- 
+  recipe(popularity ~ ., data = pop_train) %>%
+  update_role(album_name, artist, track, new_role = "id") %>%
+  step_corr(all_numeric_predictors(), threshold = 0.7) %>%
+  step_normalize(all_numeric_predictors()) 
+#%>%
+ # step_tokenize(track, custom_token = split_category) %>%
+  #step_stopwords(track) %>%
+  #step_tokenfilter(track, max_times = 100) %>%
+  #step_tf(track)
+
+juiced <- pop_rec %>% prep() %>% juice()  
+juiced %>% names()
+```
+
+# xgboost
+```{r}
+xgb_spec <-
+  boost_tree(
+    trees = tune(),
+    mtry = tune(),
+    learn_rate = 0.1
+  ) %>%
+  set_engine("xgboost") %>%
+  set_mode("regression")
+
+xgb_wf <- workflow(pop_rec, xgb_spec)
+
+set.seed(123)
+xgb_grid <-
+  grid_max_entropy(
+    trees(c(5L, 1000L)),
+    mtry(c(5L, 10L)),
+    size = 20
+  )
+
+xgb_grid
+```
+
+## Evaluate models
+
+Now we can use tune_race_anova() to eliminate parameter combinations that are not doing well.
+```{r}
+doParallel::registerDoParallel()
+
+set.seed(234)
+xgb_pop_rs <-
+  tune_grid(
+    xgb_wf,
+    pop_folds,
+    grid = xgb_grid,
+    control = control_grid(save_pred = T,
+                           pkgs = c("stringr", "stringi")))
+
+xgb_pop_rs
+```
+
+
+```{r}
+xgb_pop_rs %>% collect_metrics()
+
+show_best(xgb_pop_rs) %>% select(mean)
+
+xgb_pop_rs %>% 
+  collect_predictions() %>%
+  distinct(popularity, .pred) %>%
+  ggplot(aes(popularity, .pred)) +
+  geom_abline(intercept = 1, lty = 2, col = "gray", col = 1) +
+  geom_point(col = "midnightblue", alpha = 0.8)
+```
+
+Let’s use last_fit() to fit one final time to the training data and evaluate one final time on the testing data.
+```{r}
+xgb_last <-
+  xgb_wf %>%
+  finalize_workflow(select_best(xgb_pop_rs, "rmse")) %>%
+  last_fit(pop_split)
+
+```
+
+An xgboost model is not directly interpretable but we have several options for understanding why the model makes the predictions it does. Let’s start with model-based variable importance using the vip package.
+```{r}
+library(vip)
+
+xgb_fit <- extract_fit_parsnip(xgb_last)
+vip(xgb_fit, geom = "point", num_features = 10)
+```
+
+The maximum playing time and minimum age are the most important predictors driving the predicted game rating.
+
+We can also use a model-agnostic approach like Shapley Additive Explanations, where the average contributions of features are computed under different combinations or “coalitions” of feature orderings. The SHAPforxgboost package makes setting this up for an xgboost model particularly nice.
+
+We start by computing what we need for SHAP values, with the underlying xgboost engine fit and the predictors in a matrix format.
+```{r}
+library(SHAPforxgboost)
+
+pop_prep <- pop_rec %>% prep() 
+
+pop_shap <-
+  shap.prep(
+    xgb_model = extract_fit_engine(xgb_fit),
+    X_train = bake(pop_prep,
+                   has_role("predictor"),
+                   new_data = NULL,
+                   composition = "matrix")
+  )
+```
+
+Now we can make visualizations! We can look at an overall summary:
+```{r}
+shap.plot.summary(pop_shap)
+
+shap.plot.summary(pop_shap, scientific = TRUE)
+```
+
+Or create partial dependence plots for specific variables:
+```{r}
+shap.plot.dependence(
+  pop_shap,
+  x = "tempo")
+
+shap.plot.dependence(
+  pop_shap,
+  x = "valence",
+  color_feature = "explicit",
+  size0 = 1.2,
+  smooth = T, add_hist = TRUE)
+```
+
+Learning this kind of complex, non-linear behavior is where xgboost models shine.
+
+One of the objects contained in final_res is a fitted workflow that we can save for future use or deployment (perhaps via readr::write_rds()) and use for prediction on new data.
+```{r}
+xgb_last <-
+  xgb_wf %>%
+  finalize_workflow(select_best(xgb_pop_rs, "rmse")) %>%
+  last_fit(pop_split)
+
+final_fitted <- xgb_last$.workflow[[1]]
+predict(final_fitted, pop_test[10:12, ])
+```
+
+We can use this fitted workflow to explore model explainability as well. Decision trees are pretty explainable already, but we might, for example, want to see a partial dependence plot for the shortcut probability and time. I like using the DALEX package for tasks like this, because it is very fully featured and has good support for tidymodels. To use DALEX with tidymodels, first you create an explainer and then you use that explainer for the task you want, like computing a PDP or Shapley explanations.
+
+Let’s start by creating our “explainer.”
+```{r}
+library(DALEXtra)
+
+pop_explainer <- explain_tidymodels(
+  final_fitted,
+  data = dplyr::select(pop_train, -popularity),
+  y = as.integer(pop_train$popularity),
+  verbose = FALSE
+)
+```
+
+Then let’s compute a partial dependence profile for time, grouped by type, which is three laps vs. one lap.
+```{r}
+pdp_time <- model_profile(
+  pop_explainer,
+  variables = "valence",
+  N = NULL,
+  groups = "explicit"
+)
+```
+
+You can use the default plotting from DALEX by calling plot(pdp_time), but if you like to customize your plots, you can access the underlying data via pdp_time$agr_profiles and pdp_time$cp_profiles.
+
+```{r}
+as_tibble(pdp_time$agr_profiles) %>%
+  mutate(`_label_` = str_remove(`_label_`, "workflow_")) %>%
+  ggplot(aes(`_x_`, `_yhat_`, color = `_label_`)) +
+  geom_line(size = 1.2, alpha = 0.8) +
+  labs(
+    x = "Valence",
+    y = "Predicted probability of popularity",
+    color = "explicit?",
+    title = "Partial dependence plot for Popularity",
+    subtitle = "Predictions from a boost tree model"
+  )
+
+```
+
+The shapes that we see here reflect how the boost tree model makes decisions along the tempo variable.
+
+
+
