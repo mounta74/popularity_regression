@@ -57,7 +57,7 @@ track %>%
   labs(fill = "Explicit?")
 
 ```
-
+We need to check if there is any correlation between numeric variables.
 ```{r}
 library(corrr)
 
@@ -70,6 +70,7 @@ track %>%
                            "white",
                            "midnightblue"))
 ```
+hopefully a few are correlated, we will tke care later on using feature engineering.
 
 #Build a model 
 Let’s start our modeling by setting up our “data budget.”
@@ -89,6 +90,8 @@ pop_folds <- bootstraps(pop_train, strata = popularity)
 pop_folds
 ```
 
+the function below has been used if you consider track variable as predictor, I did it but tarck did not have a significant impact on the model, that's way I dopped it.
+in prop_rec I included the if you wanna give it a try.
 
 ```{r}
 library(tidytext)
@@ -117,7 +120,7 @@ pop_rec <-
 juiced <- pop_rec %>% prep() %>% juice()  
 juiced %>% names()
 ```
-
+I choose xgboost because of package SHAPforxgboost that only function with it. It is applicale in machine learining interpretability.
 # xgboost
 ```{r}
 xgb_spec <-
@@ -144,7 +147,7 @@ xgb_grid
 
 ## Evaluate models
 
-Now we can use tune_race_anova() to eliminate parameter combinations that are not doing well.
+Now we can use tune_grid and we'll see 
 ```{r}
 doParallel::registerDoParallel()
 
@@ -155,7 +158,7 @@ xgb_pop_rs <-
     pop_folds,
     grid = xgb_grid,
     control = control_grid(save_pred = T,
-                           pkgs = c("stringr", "stringi")))
+                           pkgs = c("stringr", "stringi"))) # needed if we include track variable. 
 
 xgb_pop_rs
 ```
@@ -286,7 +289,7 @@ as_tibble(pdp_time$agr_profiles) %>%
 
 ```
 
-The shapes that we see here reflect how the boost tree model makes decisions along the tempo variable.
+The shapes that we see here reflect how the boost tree model makes decisions along the explicit variable.
 
 
 
